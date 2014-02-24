@@ -22,17 +22,17 @@ server = module.exports = connect(
 
   # When a client connects, send it a simple message saying its app version
   browserChannel base:'/notify', (session) ->
-    session.send {appVersion: session.appVersion}
+    session.write {appVersion: session.appVersion}
 
   # Echo back any JSON messages a client sends.
   browserChannel base:'/echo', (session) ->
-    session.on 'message', (message) ->
-      session.send message
+    session.on 'data', (message) ->
+      session.write message
 
   # Echo back any maps the client sends
   browserChannel base:'/echomap', (session) ->
     session.on 'map', (message) ->
-      session.send message
+      session.write message
 
   # This server aborts incoming sessions *immediately*.
   browserChannel base:'/dc1', (session) ->

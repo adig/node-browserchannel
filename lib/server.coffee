@@ -26,8 +26,8 @@ querystring = require 'querystring'
 # `fs` is used to read & serve the client library
 fs = require 'fs'
 
-# Client sessions are `EventEmitters`
-{EventEmitter} = require 'events'
+# Client sessions are duplex node streams
+{Duplex} = require 'stream'
 # Client session Ids are generated using `node-hat`
 hat = require('hat').rack(40, 36)
 
@@ -409,8 +409,11 @@ if process.env.NODE_ENV != 'production'
         clientCode = fs.readFileSync clientFile, 'utf8'
         clientStats = curr
 
-BrowserChannelSession = (address, query, headers, options) ->
-  EventEmitter.call this
+# This code was rewritten from closure-style to class style to help @nateps
+# track down memory leaks (they weren't here) and make the code run faster. V8
+# loves this code style even though I hate it.
+BCSession = (address, query, headers, options) ->
+  Duplex.call this, objectMode: true, allowHalfOpen: false
 
   # The session's unique ID for this connection
   @id = hat()
@@ -542,26 +545,32 @@ BrowserChannelSession = (address, query, headers, options) ->
   # Because of the funky retry-has-extra-maps logic, we'll allow processing requests twice.
   @_ridBuffer = order query.RID, true
 
+  # If the user calls .end() on the stream, we'll emit 'finish' and should close the stream.
+  @on 'finish', => @close()
+
   return
 
-# Sessions extend node's [EventEmitter][] so they
-# have access to goodies like `session.on(event, handler)`,
-# `session.emit('paarty')`, etc.
-# [EventEmitter]: http://nodejs.org/docs/v0.4.12/api/events.html
-do ->
-  for name, method of EventEmitter::
-    BrowserChannelSession::[name] = method
-  return
+# Sessions extend node's duplex streams. Most people should simply use the
+# nodejs [streams API](http://nodejs.org/api/stream.html) when interacting with them.
+BCSession.prototype = Object.create Duplex.prototype
+
+# We don't implement backchannel pressure correctly. A better implementation
+# might hold POST requests from the client when the stream's buffer is full and
+# wait to reply, although this can cause its own set of problems.
+#
+# Generally browserchannel connections aren't designed to be used to send
+# entire files - you should use a normal express endpoint for that.
+BCSession::_read = ->
 
 # The state is modified through this method. It emits events when the state
 # changes. (yay)
-BrowserChannelSession::_changeState = (newState) ->
+BCSession::_changeState = (newState) ->
   oldState = @state
   @state = newState
   @emit 'state changed', @state, oldState
 
-BackChannel = (session, res, query) ->
-  @res = res
+# A backchannel is a hanging GET that the server uses to send data back to the client.
+BackChannel = (session, @res, query) ->
   @methods = messagingMethods session.options, query, res
   @chunk = query.CI == '0'
   @bytesSent = 0
@@ -570,10 +579,7 @@ BackChannel = (session, res, query) ->
     session._clearBackChannel res
   return
 
-# I would like this method to be private or something, but it needs to be accessed from
-# the HTTP request code below. The _ at the start will hopefully make people think twice
-# before using it.
-BrowserChannelSession::_setBackChannel = (res, query) ->
+BCSession::_setBackChannel = (res, query) ->
   @_clearBackChannel()
 
   @_backChannel = new BackChannel this, res, query
@@ -601,7 +607,7 @@ BrowserChannelSession::_setBackChannel = (res, query) ->
 
 # This method removes the back channel and any state associated with it. It'll get called
 # when the backchannel closes naturally, is replaced or when the connection closes.
-BrowserChannelSession::_clearBackChannel = (res) ->
+BCSession::_clearBackChannel = (res) ->
   # clearBackChannel doesn't do anything if we call it repeatedly.
   return unless @_backChannel
   # Its important that we only delete the backchannel if the closed connection is actually
@@ -624,15 +630,15 @@ BrowserChannelSession::_clearBackChannel = (res) ->
   @_refreshSessionTimeout()
 
 # This method sets / resets the heartbeat timeout to the full 15 seconds.
-BrowserChannelSession::_refreshHeartbeat = ->
+BCSession::_refreshHeartbeat = ->
   clearTimeout @_heartbeat
 
   session = this
   @_heartbeat = setInterval ->
-    session.send ['noop']
+    session.sendMessage ['noop']
   , @options.keepAliveInterval
 
-BrowserChannelSession::_refreshSessionTimeout = ->
+BCSession::_refreshSessionTimeout = ->
   clearTimeout @_sessionTimeout
 
   session = this
@@ -641,7 +647,7 @@ BrowserChannelSession::_refreshSessionTimeout = ->
   , @options.sessionTimeoutInterval
 
 # The arrays get removed once they've been acknowledged
-BrowserChannelSession::_acknowledgeArrays = (id) ->
+BCSession::_acknowledgeArrays = (id) ->
   id = parseInt id if typeof id is 'string'
 
   while @_outgoingArrays.length > 0 and @_outgoingArrays[0].id <= id
@@ -652,6 +658,7 @@ BrowserChannelSession::_acknowledgeArrays = (id) ->
 
   return
 
+# Again, this class exists purely to help with memory profiling & make V8 happy. Its basically a JSON blob.
 OutgoingArray = (@id, @data, @sendcallback, @confirmcallback) ->
 
 # Queue an array to be sent. The optional callbacks notifies a caller when the array has been
@@ -661,7 +668,7 @@ OutgoingArray = (@id, @data, @sendcallback, @confirmcallback) ->
 # error.
 #
 # queueArray returns the ID of the queued data chunk.
-BrowserChannelSession::_queueArray = (data, sendcallback, confirmcallback) ->
+BCSession::_queueArray = (data, sendcallback, confirmcallback) ->
   return confirmcallback? new Error 'closed' if @state is 'closed'
 
   id = ++@_lastArrayId
@@ -669,19 +676,35 @@ BrowserChannelSession::_queueArray = (data, sendcallback, confirmcallback) ->
 
   return @_lastArrayId
 
-# Send the array data through the backchannel. This takes an optional callback which
-# will be called with no arguments when the client acknowledges the array, or called with an
-# error object if the client disconnects before the array is sent.
+# This is the internal direct message sending method. calling sendMessage()
+# directly bypasses nodejs's stream.write() implementation (although
+# stream.write() doesn't really do anything for browserchannel - all the
+# buffering happens here).
 #
-# queueArray can also take a callback argument which is called when the session sends the message
-# in the first place. I'm not sure if I should expose this through send - I can't tell if its
-# useful beyond the server code.
-BrowserChannelSession::send = (arr, callback) ->
-  id = @_queueArray arr, null, callback
+# The big advantage of calling sendMessage() directly is you can pass in
+# callbacks which are fired when your message is initially sent, and when the
+# message has been acknowledged by the client. Both of these callbacks are
+# called with no arguments.
+#
+# Important: Don't mix calls to sendMessage() and write() - use one or the other.
+BCSession::sendMessage = (data, sendcallback, confirmcallback) ->
+  id = @_queueArray data, sendcallback, confirmcallback
   @flush()
   return id
 
-BrowserChannelSession::_receivedData = (rid, data) ->
+# This is the method which the streams API will call when you call stream.write().
+# node-browserchannel knows both when the message is originally sent, and when
+# the message is acknowledged. If you care about these events, use
+# sendMessage() above.
+BCSession::_write = (data, encoding, callback) ->
+  # The encoding is unused because we're in object mode. In theory the callback
+  # is called when the message has been flushed, but in reality
+  # node-browserchannel (for quite sensible reasons) has its own internal
+  # buffering, so the callback is called immediately.
+  @sendMessage data
+  callback()
+
+BCSession::_receivedData = (rid, data) ->
   session = this
   @_ridBuffer rid, ->
     return if data is null
@@ -710,20 +733,20 @@ BrowserChannelSession::_receivedData = (rid, data) ->
             catch e
               session.close 'Invalid JSON'
               return
-            session.emit 'message', message
+            session.push message
           # Raw string messages are embedded in a _S: property in a map.
-          else if map._S?
-            session.emit 'message', map._S
+          else if map.S?
+            session.push map.S
     else
       # We have data.json. We'll just emit it directly.
       for message in data.json
         session._mapBuffer id++, do (map) -> ->
           return if session.state is 'closed'
-          session.emit 'message', message
+          session.push message
 
     return
 
-BrowserChannelSession::_disconnectAt = (rid) ->
+BCSession::_disconnectAt = (rid) ->
   session = this
   @_ridBuffer rid, -> session.close 'Disconnected'
 
@@ -731,7 +754,7 @@ BrowserChannelSession::_disconnectAt = (rid) ->
 # client if it should reopen the backchannel.
 #
 # This method returns what the forward channel should reply with.
-BrowserChannelSession::_backChannelStatus = ->
+BCSession::_backChannelStatus = ->
   # Find the arrays have been sent over the wire but haven't been acknowledged yet
   numUnsentArrays = @_lastArrayId - @_lastSentArrayId
   unacknowledgedArrays = @_outgoingArrays[... @_outgoingArrays.length - numUnsentArrays]
@@ -770,11 +793,11 @@ BrowserChannelSession::_backChannelStatus = ->
 
 # This will actually send the arrays to the backchannel on the next tick if the backchannel
 # is alive.
-BrowserChannelSession::flush = ->
+BCSession::flush = ->
   session = this
   process.nextTick -> session._flush()
 
-BrowserChannelSession::_flush = ->
+BCSession::_flush = ->
   return unless @_backChannel
 
   numUnsentArrays = @_lastArrayId - @_lastSentArrayId
@@ -827,7 +850,7 @@ BrowserChannelSession::_flush = ->
 # you've sent the stop message or something, but if I did that it wouldn't be obvious that you
 # can still receive messages after stop() has been called. (Because you can!). That would never
 # come up when you're testing locally, but it *would* come up in production. This is more obvious.
-BrowserChannelSession::stop = (callback) ->
+BCSession::stop = (callback) ->
   return if @state is 'closed'
   @_queueArray ['stop'], callback, null
   @flush()
@@ -837,10 +860,11 @@ BrowserChannelSession::stop = (callback) ->
 # The client might try and reconnect if you only call `close()`. It'll get a new session if it does so.
 #
 # close takes an optional message argument, which is passed to the send event handlers.
-BrowserChannelSession::close = (message) ->
+BCSession::close = (message) ->
   # You can't double-close.
   return if @state == 'closed'
 
+  @push null
   @_changeState 'closed'
   @emit 'close', message
 
@@ -904,7 +928,7 @@ module.exports = browserChannel = (options, onConnect) ->
       oldSession._acknowledgeArrays oldArrayId
       oldSession.close 'Reconnected'
 
-    session = new BrowserChannelSession address, query, headers, options
+    session = new BCSession address, query, headers, options
 
     sessions[session.id] = session
     session.on 'close', ->

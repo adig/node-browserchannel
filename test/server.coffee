@@ -69,7 +69,7 @@ expectCalls = (n, callback) ->
 
 # This returns a function that calls done() after it has been called n times. Its
 # useful when you want a bunch of mini tests inside one test case.
-makePassPart = (test, n) ->
+makePassPart = (done, n) ->
   expectCalls n, -> done()
 
 # Most of these tests will make HTTP requests. A lot of the time, we don't care about the
@@ -351,7 +351,7 @@ suite 'server', ->
 
     sessionCreated = (session) ->
       # Make the backchannel flush as soon as its opened
-      session.send "flush"
+      session.write "flush"
 
       req = http.get {path:"/channel/bind?VER=8&RID=rpc&SID=#{session.id}&AID=0&TYPE=xmlhttp&CI=0", host:'localhost', port:port}, (res) =>
         assert.strictEqual res.headers['access-control-allow-origin'], 'foo.com'
@@ -707,9 +707,9 @@ suite 'server', ->
   test 'The server tells the client how much unacknowledged data there is in the post response', (done) -> @connect ->
     process.nextTick =>
       # I'm going to send a few messages to the client and acknowledge the first one in a post response.
-      @session.send 'message 1'
-      @session.send 'message 2'
-      @session.send 'message 3'
+      @session.write 'message 1'
+      @session.write 'message 2'
+      @session.write 'message 3'
 
     # We'll make a backchannel and get the data
     req = @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=xmlhttp&CI=0", (res) =>
@@ -730,7 +730,7 @@ suite 'server', ->
   test 'The server returns data on the initial connection when send is called immediately', (done) ->
     testData = ['hello', 'there', null, 1000, {}, [], [555]]
     @onSession = (@session) =>
-      @session.send testData
+      @session.write testData
 
     # I'm not using @connect because we need to know about the response to the first POST.
     @post '/channel/bind?VER=8&RID=1000&t=1', 'count=0', (res) =>
@@ -741,7 +741,7 @@ suite 'server', ->
   test 'The server escapes tricky characters before sending JSON over the wire', (done) ->
     testData = {'a': 'hello\u2028\u2029there\u2028\u2029'}
     @onSession = (@session) =>
-      @session.send testData
+      @session.write testData
 
     # I'm not using @connect because we need to know about the response to the first POST.
     @post '/channel/bind?VER=8&RID=1000&t=1', 'count=0', (res) =>
@@ -755,7 +755,7 @@ suite 'server', ->
     # The first response to the server is sent after this method returns, so if we send the data
     # in process.nextTick, it'll get buffered.
     process.nextTick =>
-      @session.send testData
+      @session.write testData
 
       req = @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=xmlhttp&CI=0", (res) =>
         readLengthPrefixedJSON res, (data) =>
@@ -778,7 +778,7 @@ suite 'server', ->
         done()
 
     # Send the data outside of the get block to make sure it makes it through.
-    soon => @session.send testData
+    soon => @session.write testData
   
   # The server should call the send callback once the data has been confirmed by the client.
   #
@@ -787,19 +787,19 @@ suite 'server', ->
   test 'The server calls send callback once data is acknowledged', (done) -> @connect ->
     lastAck = null
 
-    @session.send [1], ->
+    @session.sendMessage [1], null, ->
       assert.strictEqual lastAck, null
       lastAck = 1
 
     process.nextTick =>
-      @session.send [2], ->
+      @session.sendMessage [2], null, ->
         assert.strictEqual lastAck, 1
         # I want to give the test time to die
         soon -> done()
 
       # This callback should actually get called with an error after the client times out. ... but I'm not
       # giving timeouts a chance to run.
-      @session.send [3], -> throw new Error 'Should not call unacknowledged send callback'
+      @session.sendMessage [3], null, -> throw new Error 'Should not call unacknowledged send callback'
 
       req = @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=1&TYPE=xmlhttp&CI=0", (res) =>
         readLengthPrefixedJSON res, (data) =>
@@ -830,7 +830,7 @@ suite 'server', ->
     testData = ['hello', 'there', null, 1000, {}, [], [555]]
 
     process.nextTick =>
-      @session.send testData
+      @session.write testData
 
       # Instead of the usual CI=0 we're passing CI=1 here.
       @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=xmlhttp&CI=1", (res) =>
@@ -844,7 +844,7 @@ suite 'server', ->
     testData = ['hello', 'there', null, 1000, {}, [], [555]]
 
     process.nextTick =>
-      @session.send testData
+      @session.write testData
 
       req = @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=xmlhttp&CI=0", (res) =>
         readLengthPrefixedJSON res, (data) =>
@@ -869,7 +869,7 @@ suite 'server', ->
     testData = ['hello', 'there', null, 1000, {}, [], [555]]
 
     process.nextTick =>
-      @session.send testData
+      @session.write testData
 
       # The type is specified as an argument here in the query string. For this test, I'm making
       # CI=1, because the test is easier to write that way.
@@ -887,7 +887,7 @@ suite 'server', ->
 #{ieJunk}<script>try  {parent.d(); }catch (e){}</script>\n""", =>
             # Because I'm lazy, I'm going to chain on a test to make sure CI=0 works as well.
             data2 = {other:'data'}
-            @session.send data2
+            @session.write data2
             # I'm setting AID=1 here to indicate that the client has seen array 1.
             req = @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=1&TYPE=html&CI=0", (res) =>
               expect res,
@@ -903,7 +903,7 @@ suite 'server', ->
     testData = ['hello', 'there', null, 1000, {}, [], [555]]
 
     process.nextTick =>
-      @session.send testData
+      @session.write testData
       # This time we're setting DOMAIN=X, and the response contains a document.domain= block. Woo.
       @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=html&CI=1&DOMAIN=foo.com", (res) =>
         expect res,
@@ -911,7 +911,7 @@ suite 'server', ->
 <script>try {parent.m(#{JSON.stringify JSON.stringify([[1, testData]]) + '\n'})} catch(e) {}</script>
 #{ieJunk}<script>try  {parent.d(); }catch (e){}</script>\n""", =>
             data2 = {other:'data'}
-            @session.send data2
+            @session.write data2
             req = @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=1&TYPE=html&CI=0&DOMAIN=foo.com", (res) =>
               expect res,
                 # Its interesting - in the test channel, the ie junk comes right after the document.domain= line,
@@ -930,7 +930,7 @@ suite 'server', ->
     testData = ['hello', 'there', null, 1000, {}, [], [555]]
 
     process.nextTick =>
-      @session.send testData
+      @session.write testData
 
       # As usual, we'll get the sent data through the backchannel connection. The connection is kept open...
       @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=xmlhttp&CI=0", (res) =>
@@ -1010,8 +1010,8 @@ suite 'server', ->
   # the server has previously sent. So, the server should resend them.
   test 'The server resends lost arrays if the client asks for them', (done) -> @connect ->
     process.nextTick =>
-      @session.send [1,2,3]
-      @session.send [4,5,6]
+      @session.write [1,2,3]
+      @session.write [4,5,6]
 
       @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=xmlhttp&CI=0", (res) =>
         readLengthPrefixedJSON res, (data) =>
@@ -1096,7 +1096,7 @@ suite 'server', ->
     # We'll create a new session in a moment when we POST with OSID and OAID.
     @onSession = ->
 
-    @session.send 1, (error) ->
+    @session.sendMessage 1, null, (error) ->
       assert.ifError error
       assert.strictEqual lastMessage, null
       lastMessage = 1
@@ -1106,12 +1106,12 @@ suite 'server', ->
       assert.strictEqual lastMessage, 2
 
     process.nextTick =>
-      @session.send 2, (error) ->
+      @session.sendMessage 2, null, (error) ->
         assert.ifError error
         assert.strictEqual lastMessage, 1
         lastMessage = 2
 
-      @session.send 3, (error) ->
+      @session.sendMessage 3, null, (error) ->
         assert.ok error
         assert.strictEqual lastMessage, 2
         lastMessage = 3
@@ -1236,13 +1236,13 @@ suite 'server', ->
       # It seems like this message shouldn't give an error, but it does because the client never confirms that
       # its received it.
       sendCallbackCalled = no
-      @session.send 'hello there', (error) ->
+      @session.sendMessage 'hello there', null, (error) ->
         assert.ok error
         assert.strictEqual error.message, 'Timed out'
         sendCallbackCalled = yes
 
       process.nextTick =>
-        @session.send 'Another message', (error) ->
+        @session.sendMessage 'Another message', null, (error) ->
           assert.ok error
           assert.strictEqual error.message, 'Timed out'
           assert.ok sendCallbackCalled
@@ -1255,13 +1255,13 @@ suite 'server', ->
       @post "/channel/bind?VER=8&RID=2000&t=1&OSID=#{@session.id}&OAID=0", 'count=0', (res) => res.socket.end()
 
       sendCallbackCalled = no
-      @session.send 'hello there', (error) ->
+      @session.sendMessage 'hello there', null, (error) ->
         assert.ok error
         assert.strictEqual error.message, 'Reconnected'
         sendCallbackCalled = yes
 
       process.nextTick =>
-        @session.send 'hi', (error) ->
+        @session.sendMessage 'hi', null, (error) ->
           assert.ok error
           assert.strictEqual error.message, 'Reconnected'
           assert.ok sendCallbackCalled
@@ -1274,13 +1274,13 @@ suite 'server', ->
     test 'when the session is closed by the server', (done) -> @connect ->
 
       sendCallbackCalled = no
-      @session.send 'hello there', (error) ->
+      @session.sendMessage 'hello there', null, (error) ->
         assert.ok error
         assert.strictEqual error.message, 'foo'
         sendCallbackCalled = yes
 
       process.nextTick =>
-        @session.send 'hi', (error) ->
+        @session.sendMessage 'hi', null, (error) ->
           assert.ok error
           assert.strictEqual error.message, 'foo'
           assert.ok sendCallbackCalled
@@ -1291,13 +1291,13 @@ suite 'server', ->
     # Finally, the server closes a connection when the client actively closes it (by firing a GET with TYPE=terminate)
     test 'when the server gets a disconnect request', (done) -> @connect ->
       sendCallbackCalled = no
-      @session.send 'hello there', (error) ->
+      @session.sendMessage 'hello there', null, (error) ->
         assert.ok error
         assert.strictEqual error.message, 'Disconnected'
         sendCallbackCalled = yes
 
       process.nextTick =>
-        @session.send 'hi', (error) ->
+        @session.sendMessage 'hi', null, (error) ->
           assert.ok error
           assert.strictEqual error.message, 'Disconnected'
           assert.ok sendCallbackCalled
@@ -1306,12 +1306,34 @@ suite 'server', ->
       @get "/channel/bind?VER=8&RID=1001&SID=#{@session.id}&TYPE=terminate", (res) -> res.socket.end()
 
   test 'If a session has close() called with no arguments, the send error message says "closed"', (done) -> @connect ->
-    @session.send 'hello there', (error) ->
+    @session.sendMessage 'hello there', null, (error) ->
       assert.ok error
       assert.strictEqual error.message, 'closed'
       done()
 
     @session.close()
+
+  test 'Calling session.end() has the same effect as calling session.close()', (done) -> @connect ->
+    p = makePassPart done, 2
+
+    @session.sendMessage 'hello there', null, (error) ->
+      assert.ok error
+      assert.strictEqual error.message, 'closed'
+      p()
+
+    @session.on 'close', p
+
+    @session.end()
+
+  test.only 'Messages sent with .send() are sent to the client', (done) -> @connect ->
+    req = @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=xmlhttp&CI=0", (res) =>
+      readLengthPrefixedJSON res, (data) ->
+        assert.deepEqual data, [[1, 'hi']]
+        req.abort()
+        done()
+
+    @session.end 'hi'
+
 
   # stop() sends a message to the client saying basically 'something is wrong, stop trying to
   # connect'. It triggers a special error in the client, and the client will stop trying to reconnect
@@ -1452,10 +1474,10 @@ suite 'server', ->
     # I can guarantee qs is awful.
     @post "/channel/bind?VER=8&RID=1001&SID=#{@session.id}&AID=0", qs, (res) => res.socket.end()
 
-    @session.once 'message', (msg) =>
+    @session.once 'data', (msg) =>
       assert.deepEqual msg, data1
 
-      @session.once 'message', (msg) ->
+      @session.once 'data', (msg) ->
         assert.deepEqual msg, data2
         done()
 
@@ -1501,20 +1523,8 @@ suite 'server', ->
 
     req.end (JSON.stringify {ofs:0, data})
   
-    @session.on 'message', (msg) ->
+    @session.on 'data', (msg) ->
       assert.deepEqual msg, data.shift()
-
-  # Hm- this test works, but the client code never recieves the null message. Eh.
-  test 'You can send null', (done) -> @connect ->
-    @session.send null
-
-    req = @get "/channel/bind?VER=8&RID=rpc&SID=#{@session.id}&AID=0&TYPE=xmlhttp&CI=0", (res) =>
-      readLengthPrefixedJSON res, (data) ->
-        assert.deepEqual data, [[1, null]]
-
-        req.abort()
-        res.socket.end()
-        done()
 
   test 'Sessions are cancelled when close() is called on the server', (done) -> @connect ->
     @session.on 'close', done
