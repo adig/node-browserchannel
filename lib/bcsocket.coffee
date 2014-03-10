@@ -240,6 +240,7 @@ BCSocket = (url, options) ->
     lastErrorCode = null
 
     session.setFailFast yes if options['failFast']
+    session.setForwardChannelRequestTimeout if options['forwardChannelRequestTimeout']
 
     # Only needed for debugging..
     #session.setChannelDebug(new goog.net.ChannelDebug())
