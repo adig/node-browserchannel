@@ -9,12 +9,11 @@
 # I've written this using the literate programming style to try it out. So, thats why
 # there's a million comments everywhere.
 #
-# The server is implemented as connect middleware. Its intended to be used like this:
+# The server is implemented an express middleware. Its intended to be used like this:
 #
 # ```
-# server = connect(
-#   browserChannel (client) -> client.send 'hi'
-# )
+# server = express();
+# server.use(browserChannel(function(client) { client.send('hi'); }));
 # ```
 
 # ## Dependancies, helper methods and constant data
@@ -28,6 +27,7 @@ fs = require 'fs'
 
 # Client sessions are `EventEmitters`
 {EventEmitter} = require 'events'
+
 # Client session Ids are generated using `node-hat`
 hat = require('hat').rack(40, 36)
 
@@ -63,6 +63,14 @@ defaultOptions =
   # You can specify the base URL which browserchannel connects to. Change this
   # if you want to scope browserchannel in part of your app, or if you want
   # /channel to mean something else, or whatever.
+  #
+  # I really want to remove this parameter - express 4.0's router is now good
+  # enough that you can just install the middleware anywhere using express. For
+  # example:
+  #   app.use('/mycoolpath', browserchannel({base:''}, ...));
+  #
+  # Unfortunately you have to force the base option to '' to do that (since it
+  # defaults to /channel otherwise). What a pain. TODO browserchannel 3.0
   base: '/channel'
 
   # We'll send keepalives every so often to make sure the http connection isn't
@@ -409,7 +417,9 @@ if process.env.NODE_ENV != 'production'
         clientCode = fs.readFileSync clientFile, 'utf8'
         clientStats = curr
 
-BrowserChannelSession = (address, query, headers, options) ->
+# This code was rewritten from closure-style to class style to make heap dumps
+# clearer and make the code run faster in V8 (v8 loves this code style).
+BCSession = (address, query, headers, options) ->
   EventEmitter.call this
 
   # The session's unique ID for this connection
@@ -439,9 +449,6 @@ BrowserChannelSession = (address, query, headers, options) ->
   #
   # - **closed**: The session has been removed from the session list. It can
   #   no longer be used for any reason.
-  #
-  #   It is invalid to send arrays to a session while it is closed. Unless you're
-  #   Bruce Willis...
   @state = 'init'
 
   # The client's reported application version, or null. This is sent when the
@@ -550,12 +557,12 @@ BrowserChannelSession = (address, query, headers, options) ->
 # [EventEmitter]: http://nodejs.org/docs/v0.4.12/api/events.html
 do ->
   for name, method of EventEmitter::
-    BrowserChannelSession::[name] = method
+    BCSession::[name] = method
   return
 
 # The state is modified through this method. It emits events when the state
 # changes. (yay)
-BrowserChannelSession::_changeState = (newState) ->
+BCSession::_changeState = (newState) ->
   oldState = @state
   @state = newState
   @emit 'state changed', @state, oldState
@@ -573,7 +580,7 @@ BackChannel = (session, res, query) ->
 # I would like this method to be private or something, but it needs to be accessed from
 # the HTTP request code below. The _ at the start will hopefully make people think twice
 # before using it.
-BrowserChannelSession::_setBackChannel = (res, query) ->
+BCSession::_setBackChannel = (res, query) ->
   @_clearBackChannel()
 
   @_backChannel = new BackChannel this, res, query
@@ -601,7 +608,7 @@ BrowserChannelSession::_setBackChannel = (res, query) ->
 
 # This method removes the back channel and any state associated with it. It'll get called
 # when the backchannel closes naturally, is replaced or when the connection closes.
-BrowserChannelSession::_clearBackChannel = (res) ->
+BCSession::_clearBackChannel = (res) ->
   # clearBackChannel doesn't do anything if we call it repeatedly.
   return unless @_backChannel
   # Its important that we only delete the backchannel if the closed connection is actually
@@ -624,7 +631,7 @@ BrowserChannelSession::_clearBackChannel = (res) ->
   @_refreshSessionTimeout()
 
 # This method sets / resets the heartbeat timeout to the full 15 seconds.
-BrowserChannelSession::_refreshHeartbeat = ->
+BCSession::_refreshHeartbeat = ->
   clearTimeout @_heartbeat
 
   session = this
@@ -632,7 +639,7 @@ BrowserChannelSession::_refreshHeartbeat = ->
     session.send ['noop']
   , @options.keepAliveInterval
 
-BrowserChannelSession::_refreshSessionTimeout = ->
+BCSession::_refreshSessionTimeout = ->
   clearTimeout @_sessionTimeout
 
   session = this
@@ -641,7 +648,7 @@ BrowserChannelSession::_refreshSessionTimeout = ->
   , @options.sessionTimeoutInterval
 
 # The arrays get removed once they've been acknowledged
-BrowserChannelSession::_acknowledgeArrays = (id) ->
+BCSession::_acknowledgeArrays = (id) ->
   id = parseInt id if typeof id is 'string'
 
   while @_outgoingArrays.length > 0 and @_outgoingArrays[0].id <= id
@@ -661,7 +668,7 @@ OutgoingArray = (@id, @data, @sendcallback, @confirmcallback) ->
 # error.
 #
 # queueArray returns the ID of the queued data chunk.
-BrowserChannelSession::_queueArray = (data, sendcallback, confirmcallback) ->
+BCSession::_queueArray = (data, sendcallback, confirmcallback) ->
   return confirmcallback? new Error 'closed' if @state is 'closed'
 
   id = ++@_lastArrayId
@@ -676,12 +683,12 @@ BrowserChannelSession::_queueArray = (data, sendcallback, confirmcallback) ->
 # queueArray can also take a callback argument which is called when the session sends the message
 # in the first place. I'm not sure if I should expose this through send - I can't tell if its
 # useful beyond the server code.
-BrowserChannelSession::send = (arr, callback) ->
+BCSession::send = (arr, callback) ->
   id = @_queueArray arr, null, callback
   @flush()
   return id
 
-BrowserChannelSession::_receivedData = (rid, data) ->
+BCSession::_receivedData = (rid, data) ->
   session = this
   @_ridBuffer rid, ->
     return if data is null
@@ -723,7 +730,7 @@ BrowserChannelSession::_receivedData = (rid, data) ->
 
     return
 
-BrowserChannelSession::_disconnectAt = (rid) ->
+BCSession::_disconnectAt = (rid) ->
   session = this
   @_ridBuffer rid, -> session.close 'Disconnected'
 
@@ -731,7 +738,7 @@ BrowserChannelSession::_disconnectAt = (rid) ->
 # client if it should reopen the backchannel.
 #
 # This method returns what the forward channel should reply with.
-BrowserChannelSession::_backChannelStatus = ->
+BCSession::_backChannelStatus = ->
   # Find the arrays have been sent over the wire but haven't been acknowledged yet
   numUnsentArrays = @_lastArrayId - @_lastSentArrayId
   unacknowledgedArrays = @_outgoingArrays[... @_outgoingArrays.length - numUnsentArrays]
@@ -770,11 +777,11 @@ BrowserChannelSession::_backChannelStatus = ->
 
 # This will actually send the arrays to the backchannel on the next tick if the backchannel
 # is alive.
-BrowserChannelSession::flush = ->
+BCSession::flush = ->
   session = this
   process.nextTick -> session._flush()
 
-BrowserChannelSession::_flush = ->
+BCSession::_flush = ->
   return unless @_backChannel
 
   numUnsentArrays = @_lastArrayId - @_lastSentArrayId
@@ -827,7 +834,7 @@ BrowserChannelSession::_flush = ->
 # you've sent the stop message or something, but if I did that it wouldn't be obvious that you
 # can still receive messages after stop() has been called. (Because you can!). That would never
 # come up when you're testing locally, but it *would* come up in production. This is more obvious.
-BrowserChannelSession::stop = (callback) ->
+BCSession::stop = (callback) ->
   return if @state is 'closed'
   @_queueArray ['stop'], callback, null
   @flush()
@@ -837,7 +844,7 @@ BrowserChannelSession::stop = (callback) ->
 # The client might try and reconnect if you only call `close()`. It'll get a new session if it does so.
 #
 # close takes an optional message argument, which is passed to the send event handlers.
-BrowserChannelSession::close = (message) ->
+BCSession::close = (message) ->
   # You can't double-close.
   return if @state == 'closed'
 
@@ -877,7 +884,7 @@ module.exports = browserChannel = (options, onConnect) ->
   base = base[... base.length - 1] if base.match /\/$/
   
   # Add a leading slash back on base
-  base = "/#{base}" unless base.match /^\//
+  base = "/#{base}" if base.length > 0 and !base.match /^\//
 
   # map from sessionId -> session
   sessions = {}
@@ -904,7 +911,7 @@ module.exports = browserChannel = (options, onConnect) ->
       oldSession._acknowledgeArrays oldArrayId
       oldSession.close 'Reconnected'
 
-    session = new BrowserChannelSession address, query, headers, options
+    session = new BCSession address, query, headers, options
 
     sessions[session.id] = session
     session.on 'close', ->

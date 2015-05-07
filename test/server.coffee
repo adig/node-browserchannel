@@ -13,7 +13,7 @@
 http = require 'http'
 assert = require 'assert'
 querystring = require 'querystring'
-connect = require 'connect'
+express = require 'express'
 
 timer = require 'timerstub'
 
@@ -38,7 +38,9 @@ createServer = (opts, method, callback) ->
   # The server is created using connect middleware. I'll simulate other middleware in
   # the stack by adding a second handler which responds with 200, 'Other middleware' to
   # any request.
-  app = connect bc, (req, res, next) ->
+  app = express()
+  app.use bc
+  app.use (req, res, next) ->
     # I might not actually need to specify the headers here... (If you don't, nodejs provides
     # some defaults).
     res.writeHead 200, 'OK', 'Content-Type': 'text/plain'
@@ -46,7 +48,7 @@ createServer = (opts, method, callback) ->
 
   # Calling server.listen() without a port lets the OS pick a port for us. I don't
   # know why more testing frameworks don't do this by default.
-  server = http.createServer(app).listen ->
+  server = http.createServer(app).listen undefined, '127.0.0.1', ->
     # Obviously, we need to know the port to be able to make requests from the server.
     # The callee could check this itself using the server object, but it'll always need
     # to know it, so its easier pulling the port out here.
