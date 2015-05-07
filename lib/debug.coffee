@@ -4,5 +4,5 @@ goog.require 'goog.debug.Logger'
 
 #logger = goog.debug.Logger.getLogger 'goog.net.BrowserChannel'
 logger = goog.debug.Logger.getLogger 'goog.net'
-logger.setLevel goog.debug.Logger.Level.FINER
+logger.setLevel goog.debug.Logger.Level.WARNING
 logger.addHandler (msg) -> console.log msg.getMessage()
